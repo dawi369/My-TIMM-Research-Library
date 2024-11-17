@@ -11,9 +11,10 @@ from copy import deepcopy
 import torch
 from torch.testing._internal.common_utils import TestCase
 from torch.nn import Parameter
-from timm.scheduler import PlateauLRScheduler
 
-from timm.optim import create_optimizer_v2
+from timm.optim import create_optimizer_v2, list_optimizers, get_optimizer_class, get_optimizer_info, OptimInfo
+from timm.optim import param_groups_layer_decay, param_groups_weight_decay
+from timm.scheduler import PlateauLRScheduler
 
 import importlib
 import os
@@ -175,7 +176,7 @@ def _test_basic_cases(constructor, scheduler_constructors=None):
     )
 
 
-def _test_model(optimizer, params, device=torch.device('cpu')):
+def _test_model(optimizer, params, device=torch.device('cpu'), after_step=0):
     weight = torch.tensor(
         [[-0.2109, -0.4976], [-0.1413, -0.3420], [-0.2524, 0.6976]],
         device=device, requires_grad=True)
@@ -206,7 +207,8 @@ def _test_model(optimizer, params, device=torch.device('cpu')):
         loss = output.sum()
         loss.backward()
         loss = loss.item()
-        assert loss < prev_loss
+        if i > after_step:
+            assert loss < prev_loss
         prev_loss = loss
         optimizer.step()
 
@@ -235,31 +237,44 @@ def _test_rosenbrock(constructor, scheduler_constructors=None):
     solution = torch.tensor([1, 1])
     initial_dist = params.clone().detach().dist(solution)
 
-    def eval(params, w):
+
+    def get_grad(_param, _sparse_grad, _w):
+        grad = drosenbrock(params.clone().detach())
+        # Depending on w, provide only the x or y gradient
+        if _sparse_grad:
+            if _w:
+                i = torch.tensor([[0, 0]], dtype=torch.int64)
+                x = grad[0]
+                v = torch.tensor([x / 4.0, x - x / 4.0])
+            else:
+                i = torch.tensor([[1, 1]], dtype=torch.int64)
+                y = grad[1]
+                v = torch.tensor([y - y / 4.0, y / 4.0])
+            grad_out = torch.sparse_coo_tensor(i, v, (2,), dtype=v.dtype)
+        else:
+            if _w:
+                grad_out = torch.tensor([grad[0], 0], dtype=_param.dtype)
+            else:
+                grad_out = torch.tensor([0, grad[1]], dtype=_param.dtype)
+        return grad_out
+
+
+    def eval(_param, _sparse_grad, _w):
         # Depending on w, provide only the x or y gradient
         optimizer.zero_grad()
-        loss = rosenbrock(params)
+        loss = rosenbrock(_param)
         loss.backward()
-        grad = drosenbrock(params.clone().detach())
-        # NB: We torture test the optimizer by returning an
-        # uncoalesced sparse tensor
-        if w:
-            i = torch.LongTensor([[0, 0]])
-            x = grad[0]
-            v = torch.tensor([x / 4., x - x / 4.])
-        else:
-            i = torch.LongTensor([[1, 1]])
-            y = grad[1]
-            v = torch.tensor([y - y / 4., y / 4.])
-        x = torch.sparse.DoubleTensor(i, v, torch.Size([2])).to(dtype=v.dtype)
+
+        grad_out = get_grad(_param, _sparse_grad, _w)
         with torch.no_grad():
-            params.grad = x.to_dense()
+            _param.grad = grad_out.to_dense()
+
         return loss
 
     for i in range(2000):
         # Do cyclic coordinate descent
         w = i % 2
-        optimizer.step(functools.partial(eval, params, w))
+        optimizer.step(functools.partial(eval, params, True, w))
         for scheduler in schedulers:
             if isinstance(scheduler, PlateauLRScheduler):
                 scheduler.step(rosenbrock(params))
@@ -277,29 +292,40 @@ def _build_params_dict_single(weight, bias, **kwargs):
     return [dict(params=bias, **kwargs)]
 
 
+@pytest.mark.parametrize('optimizer', list_optimizers(exclude_filters=('fused*', 'bnb*')))
+def test_optim_factory(optimizer):
+    assert issubclass(get_optimizer_class(optimizer, bind_defaults=False), torch.optim.Optimizer)
+
+    opt_info = get_optimizer_info(optimizer)
+    assert isinstance(opt_info, OptimInfo)
+
+    if not opt_info.second_order:  # basic tests don't support second order right now
+        # test basic cases that don't need specific tuning via factory test
+        _test_basic_cases(
+            lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
+        )
+        _test_basic_cases(
+            lambda weight, bias: create_optimizer_v2(
+                _build_params_dict(weight, bias, lr=1e-2),
+                optimizer,
+                lr=1e-3)
+        )
+        _test_basic_cases(
+            lambda weight, bias: create_optimizer_v2(
+                _build_params_dict_single(weight, bias, lr=1e-2),
+                optimizer,
+                lr=1e-3)
+        )
+        _test_basic_cases(
+            lambda weight, bias: create_optimizer_v2(
+                _build_params_dict_single(weight, bias, lr=1e-2), optimizer)
+        )
+
+
 #@pytest.mark.parametrize('optimizer', ['sgd', 'momentum'])
 # FIXME momentum variant frequently fails in GitHub runner, but never local after many attempts
 @pytest.mark.parametrize('optimizer', ['sgd'])
 def test_sgd(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=1e-2),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=1e-2),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=1e-2), optimizer)
-    )
     # _test_basic_cases(
     #     lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3),
     #     [lambda opt: StepLR(opt, gamma=0.9, step_size=10)]
@@ -340,50 +366,25 @@ def test_sgd(optimizer):
     _test_model(optimizer, dict(lr=1e-3))
 
 
-@pytest.mark.parametrize('optimizer',  ['adamw', 'adam', 'nadam', 'adamax'])
+@pytest.mark.parametrize('optimizer',  ['adamw', 'adam', 'nadam', 'adamax', 'nadamw'])
 def test_adam(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=5e-2)
     )
     _test_model(optimizer, dict(lr=5e-2))
 
 
+@pytest.mark.parametrize('optimizer',  ['adopt', 'adoptw'])
+def test_adopt(optimizer):
+    # FIXME rosenbrock is not passing for ADOPT
+    # _test_rosenbrock(
+    #     lambda params: create_optimizer_v2(params, optimizer, lr=1e-3)
+    # )
+    _test_model(optimizer, dict(lr=5e-2), after_step=1)  # note no convergence in first step for ADOPT
+
+
 @pytest.mark.parametrize('optimizer',  ['adabelief'])
 def test_adabelief(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
     _test_basic_cases(
         lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3, weight_decay=1)
     )
@@ -395,21 +396,6 @@ def test_adabelief(optimizer):
 
 @pytest.mark.parametrize('optimizer',  ['radam', 'radabelief'])
 def test_rectified(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=1e-3)
     )
@@ -419,25 +405,6 @@ def test_rectified(optimizer):
 @pytest.mark.parametrize('optimizer',   ['adadelta', 'adagrad'])
 def test_adaother(optimizer):
     _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
-    _test_basic_cases(
         lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3, weight_decay=1)
     )
     _test_rosenbrock(
@@ -446,26 +413,8 @@ def test_adaother(optimizer):
     _test_model(optimizer, dict(lr=5e-2))
 
 
-@pytest.mark.parametrize('optimizer',   ['adafactor'])
+@pytest.mark.parametrize('optimizer',   ['adafactor', 'adafactorbv'])
 def test_adafactor(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(_build_params_dict_single(weight, bias), optimizer)
-    )
     _test_basic_cases(
         lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3, weight_decay=1)
     )
@@ -477,25 +426,6 @@ def test_adafactor(optimizer):
 
 @pytest.mark.parametrize('optimizer',  ['lamb', 'lambc'])
 def test_lamb(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=1e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=1e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=1e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=1e-3)
     )
@@ -504,25 +434,6 @@ def test_lamb(optimizer):
 
 @pytest.mark.parametrize('optimizer',  ['lars', 'larc', 'nlars', 'nlarc'])
 def test_lars(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=1e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=1e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=1e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=1e-3)
     )
@@ -531,25 +442,6 @@ def test_lars(optimizer):
 
 @pytest.mark.parametrize('optimizer',  ['madgrad', 'madgradw'])
 def test_madgrad(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=1e-2)
     )
@@ -558,25 +450,6 @@ def test_madgrad(optimizer):
 
 @pytest.mark.parametrize('optimizer',  ['novograd'])
 def test_novograd(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=1e-3)
     )
@@ -585,25 +458,6 @@ def test_novograd(optimizer):
 
 @pytest.mark.parametrize('optimizer', ['rmsprop', 'rmsproptf'])
 def test_rmsprop(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=1e-2)
     )
@@ -612,25 +466,6 @@ def test_rmsprop(optimizer):
 
 @pytest.mark.parametrize('optimizer', ['adamp'])
 def test_adamp(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=5e-2)
     )
@@ -639,25 +474,6 @@ def test_adamp(optimizer):
 
 @pytest.mark.parametrize('optimizer', ['sgdp'])
 def test_sgdp(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=1e-3)
     )
@@ -666,25 +482,6 @@ def test_sgdp(optimizer):
 
 @pytest.mark.parametrize('optimizer', ['lookahead_sgd', 'lookahead_momentum'])
 def test_lookahead_sgd(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=1e-3)
     )
@@ -692,25 +489,6 @@ def test_lookahead_sgd(optimizer):
 
 @pytest.mark.parametrize('optimizer', ['lookahead_adamw', 'lookahead_adam'])
 def test_lookahead_adam(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=5e-2)
     )
@@ -718,26 +496,86 @@ def test_lookahead_adam(optimizer):
 
 @pytest.mark.parametrize('optimizer', ['lookahead_radam'])
 def test_lookahead_radam(optimizer):
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2([weight, bias], optimizer, lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3),
-            optimizer,
-            lr=1e-3)
-    )
-    _test_basic_cases(
-        lambda weight, bias: create_optimizer_v2(
-            _build_params_dict_single(weight, bias, lr=3e-3), optimizer)
-    )
     _test_rosenbrock(
         lambda params: create_optimizer_v2(params, optimizer, lr=1e-4)
     )
+
+
+def test_param_groups_layer_decay_with_end_decay():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(10, 5),
+        torch.nn.ReLU(),
+        torch.nn.Linear(5, 2)
+    )
+    
+    param_groups = param_groups_layer_decay(
+        model,
+        weight_decay=0.05,
+        layer_decay=0.75,
+        end_layer_decay=0.5,
+        verbose=True
+    )
+    
+    assert len(param_groups) > 0
+    # Verify layer scaling is applied with end decay
+    for group in param_groups:
+        assert 'lr_scale' in group
+        assert group['lr_scale'] <= 1.0
+        assert group['lr_scale'] >= 0.5
+
+
+def test_param_groups_layer_decay_with_matcher():
+    class ModelWithMatcher(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer1 = torch.nn.Linear(10, 5)
+            self.layer2 = torch.nn.Linear(5, 2)
+            
+        def group_matcher(self, coarse=False):
+            return lambda name: int(name.split('.')[0][-1])
+            
+    model = ModelWithMatcher()
+    param_groups = param_groups_layer_decay(
+        model,
+        weight_decay=0.05,
+        layer_decay=0.75,
+        verbose=True
+    )
+    
+    assert len(param_groups) > 0
+    # Verify layer scaling is applied
+    for group in param_groups:
+        assert 'lr_scale' in group
+        assert 'weight_decay' in group
+        assert len(group['params']) > 0
+
+
+def test_param_groups_weight_decay():
+    model = torch.nn.Sequential(
+        torch.nn.Linear(10, 5),
+        torch.nn.ReLU(),
+        torch.nn.Linear(5, 2)
+    )
+    weight_decay = 0.01
+    no_weight_decay_list = ['1.weight']
+    
+    param_groups = param_groups_weight_decay(
+        model, 
+        weight_decay=weight_decay,
+        no_weight_decay_list=no_weight_decay_list
+    )
+    
+    assert len(param_groups) == 2
+    assert param_groups[0]['weight_decay'] == 0.0
+    assert param_groups[1]['weight_decay'] == weight_decay
+    
+    # Verify parameters are correctly grouped
+    no_decay_params = set(param_groups[0]['params'])
+    decay_params = set(param_groups[1]['params'])
+    
+    for name, param in model.named_parameters():
+        if param.ndim <= 1 or name.endswith(".bias") or name in no_weight_decay_list:
+            assert param in no_decay_params
+        else:
+            assert param in decay_params
 

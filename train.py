@@ -15,6 +15,7 @@ NVIDIA CUDA specific speedups adopted from NVIDIA Apex examples
 Hacked together by / Copyright 2020 Ross Wightman (https://github.com/rwightman)
 """
 import argparse
+import copy
 import importlib
 import json
 import logging
@@ -48,12 +49,6 @@ try:
 except ImportError:
     has_apex = False
 
-has_native_amp = False
-try:
-    if getattr(torch.cuda.amp, 'autocast') is not None:
-        has_native_amp = True
-except AttributeError:
-    pass
 
 try:
     import wandb
@@ -374,7 +369,7 @@ group.add_argument('--checkpoint-hist', type=int, default=10, metavar='N',
 group.add_argument('-j', '--workers', type=int, default=4, metavar='N',
                    help='how many training processes to use (default: 4)')
 group.add_argument('--save-images', action='store_true', default=False,
-                   help='save images of input bathes every log interval for debugging')
+                   help='save images of input batches every log interval for debugging')
 group.add_argument('--pin-mem', action='store_true', default=False,
                    help='Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.')
 group.add_argument('--no-prefetcher', action='store_true', default=False,
@@ -442,7 +437,6 @@ def main():
             use_amp = 'apex'
             assert args.amp_dtype == 'float16'
         else:
-            assert has_native_amp, 'Please update PyTorch to a version with native AMP (or use APEX).'
             use_amp = 'native'
             assert args.amp_dtype in ('float16', 'bfloat16')
         if args.amp_dtype == 'bfloat16':
@@ -561,6 +555,13 @@ def main():
         **optimizer_kwargs(cfg=args),
         **args.opt_kwargs,
     )
+    if utils.is_primary(args):
+        defaults = copy.deepcopy(optimizer.defaults)
+        defaults['weight_decay'] = args.weight_decay  # this isn't stored in optimizer.defaults
+        defaults = ', '.join([f'{k}: {v}' for k, v in defaults.items()])
+        logging.info(
+            f'Created {type(optimizer).__name__} ({args.opt}) optimizer: {defaults}'
+        )
 
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
@@ -572,15 +573,10 @@ def main():
         if utils.is_primary(args):
             _logger.info('Using NVIDIA APEX AMP. Training in mixed precision.')
     elif use_amp == 'native':
-        try:
-            amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
-        except (AttributeError, TypeError):
-            # fallback to CUDA only AMP for PyTorch < 1.10
-            assert device.type == 'cuda'
-            amp_autocast = torch.cuda.amp.autocast
-        if device.type == 'cuda' and amp_dtype == torch.float16:
+        amp_autocast = partial(torch.autocast, device_type=device.type, dtype=amp_dtype)
+        if device.type in ('cuda',) and amp_dtype == torch.float16:
             # loss scaler only used for float16 (half) dtype, bfloat16 does not need it
-            loss_scaler = NativeScaler()
+            loss_scaler = NativeScaler(device=device.type)
         if utils.is_primary(args):
             _logger.info('Using native Torch AMP. Training in mixed precision.')
     else:
@@ -844,8 +840,13 @@ def main():
             lr_scheduler.step(start_epoch)
 
     if utils.is_primary(args):
+        if args.warmup_prefix:
+            sched_explain = '(warmup_epochs + epochs + cooldown_epochs). Warmup added to total when warmup_prefix=True'
+        else:
+            sched_explain = '(epochs + cooldown_epochs). Warmup within epochs when warmup_prefix=False'
         _logger.info(
-            f'Scheduled epochs: {num_epochs}. LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
+            f'Scheduled epochs: {num_epochs} {sched_explain}. '
+            f'LR stepped per {"epoch" if lr_scheduler.t_in_epochs else "update"}.')
 
     results = []
     try:
@@ -1054,8 +1055,11 @@ def train_one_epoch(
         if model_ema is not None:
             model_ema.update(model, step=num_updates)
 
-        if args.synchronize_step and device.type == 'cuda':
-            torch.cuda.synchronize()
+        if args.synchronize_step:
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            elif device.type == 'npu':
+                torch.npu.synchronize()
         time_now = time.time()
         update_time_m.update(time.time() - update_start_time)
         update_start_time = time_now
@@ -1155,6 +1159,8 @@ def validate(
 
             if device.type == 'cuda':
                 torch.cuda.synchronize()
+            elif device.type == "npu":
+                torch.npu.synchronize()
 
             losses_m.update(reduced_loss.item(), input.size(0))
             top1_m.update(acc1.item(), output.size(0))

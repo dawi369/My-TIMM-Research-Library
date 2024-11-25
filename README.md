@@ -1,4 +1,4 @@
-# PyTorch Image Models (Customized for my Academic and Research Use📑)
+# My PyTorch Image Models Library (Customized for my Academic and Research Use📑)
 
 This fork of the `timm` library is tailored for academic and research applications, including thesis work and other scholarly pursuits. While it retains the rich feature set of the original repository, this fork emphasizes my own work, reproducibility, and academic documentation.
 

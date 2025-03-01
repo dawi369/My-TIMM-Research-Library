@@ -1,10 +1,9 @@
 # My PyTorch Image Models Library (Customized for my Academic and Research Use📑)
 
-This fork of the `timm` library is tailored for academic and research applications, including thesis work and other scholarly pursuits. While it retains the rich feature set of the original repository, this fork emphasizes my own work, reproducibility, and academic documentation.
+This fork of the `timm` library is tailored for academic and research applications, including semester work and other scholarly pursuits. While it retains the rich feature set of the original repository, this fork emphasizes my own work, reproducibility, and academic documentation.
 
 The repository is especially suitable for:
 
-- **Thesis Projects**: Optimized tools and frameworks for deep learning research in image processing and model optimization.
 - **Academic Research**: A modular setup that simplifies adaptation for novel architectures and experimental setups.
 - **Education**: Comprehensive resources for learning state-of-the-art (SOTA) image modeling techniques.
 
